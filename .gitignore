@@ -1,0 +1,14 @@
+# Virtual Environment
+venv/
+.venv/
+
+# Local Face Datasets & Temp Cache
+dataset/
+user_data.pkl
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Heavy Landmark Models (Keep out of GitHub due to file size limits)
+*.dat
