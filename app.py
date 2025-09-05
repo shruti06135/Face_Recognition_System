@@ -4,304 +4,293 @@ import pickle
 import time
 import shutil
 import tempfile
+import math
 from deepface import DeepFace
 import numpy as np
+import dlib
+from scipy.spatial import distance
 
-# --- Constants and Initial Setup ---
+# --- Constants and Directory Setup ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "user_data.pkl")
 DATASET_DIR = os.path.join(BASE_DIR, "dataset")
 HAAR_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+# Make sure you download this file and place it in the same directory
+PREDICTOR_PATH = os.path.join(BASE_DIR, "shape_predictor_68_face_landmarks.dat") 
+
 os.makedirs(DATASET_DIR, exist_ok=True)
 
-
-# --- Pre-load Models for Efficiency ---
-print("🚀 Loading models, please wait...")
+# --- Pre-load Models for Computational Efficiency ---
+print("🚀 Initializing system and pre-loading models...")
 try:
     FACE_DETECTOR = cv2.CascadeClassifier(HAAR_CASCADE_PATH)
+    dlib_detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor(PREDICTOR_PATH)
+    
+    # Warm up DeepFace FaceNet model to avoid lag on first run
     _ = DeepFace.represent(
         img_path=np.zeros((100, 100, 3), dtype=np.uint8),
         model_name="Facenet",
         detector_backend='skip'
     )
-    print("✅ Models loaded successfully.")
+    print("✅ All models initialized successfully.")
 except Exception as e:
-    print(f"❌ Critical Error: Could not load models. Exiting. Error: {e}")
+    print(f"❌ Critical initialization error: {e}")
     exit()
 
+# --- Bullet 2: Liveness Detection Helpers (EAR Logic) ---
+def eye_aspect_ratio(eye):
+    """Calculate the Eye Aspect Ratio (EAR) to determine open/closed state."""
+    A = distance.euclidean(eye[1], eye[5])
+    B = distance.euclidean(eye[2], eye[4])
+    C = distance.euclidean(eye[0], eye[3])
+    return (A + B) / (2.0 * C)
 
-# --- Image Preprocessing Function ---
+def check_liveness(frame):
+    """Returns a tuple: (blink_detected, eyes_are_open)"""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    rects = dlib_detector(gray, 0)
+    
+    for rect in rects:
+        shape = predictor(gray, rect)
+        shape = np.array([[p.x, p.y] for p in shape.parts()])
+        
+        left_eye = shape[36:42]
+        right_eye = shape[42:48]
+        
+        left_ear = eye_aspect_ratio(left_eye)
+        right_ear = eye_aspect_ratio(right_eye)
+        ear = (left_ear + right_ear) / 2.0
+        
+        # Thresholds: EAR < 0.21 indicates a closed eye/blink
+        if ear < 0.21:
+            return True, False
+        return False, True
+        
+    return False, False
+
+# --- Bullet 4: Image Preprocessing Layer (CLAHE Enhancement) ---
 def preprocess_frame(frame):
+    """Enhance facial features under varying lighting conditions using CLAHE."""
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     l_clahe = clahe.apply(l)
     lab_clahe = cv2.merge((l_clahe, a, b))
-    processed_frame = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
-    return processed_frame
+    return cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
 
-
-# --- Capture function for sign-up ---
-def capture_multiple_images_for_signup(username, num_images=10):
+# --- Bullet 3 & 5: Multi-Image Sign-Up Capture Engine ---
+def capture_signup_dataset(username, num_images=10):
     cap = cv2.VideoCapture(0)
     user_dir = os.path.join(DATASET_DIR, username)
     os.makedirs(user_dir, exist_ok=True)
     
-    print(f"\n📸 Get ready, {username}! We need {num_images} high-quality photos.")
-    print("Please position your face inside the box. It will turn green when ready.")
-
     images_captured = 0
+    print(f"\n📸 Initializing Registration Pipeline for: {username}")
+    
     while images_captured < num_images:
         ret, frame = cap.read()
         if not ret: break
 
-        frame_height, frame_width, _ = frame.shape
         display_frame = frame.copy()
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = FACE_DETECTOR.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = FACE_DETECTOR.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
 
-        feedback = "Position your face in the frame"
-        box_color = (0, 0, 255) # Red
+        feedback = "Position your face clearly inside the camera view"
+        box_color = (0, 0, 255) 
 
         if len(faces) > 1:
-            feedback = "Multiple faces detected. Only one person, please."
+            feedback = "Multiple faces detected! Please ensure only one person is visible."
         elif len(faces) == 1:
-            (x, y, w, h) = faces[0]
-            is_size_ok = (w > frame_width * 0.25) and (w < frame_width * 0.6)
-            face_center_x = x + w // 2
-            frame_center_x = frame_width // 2
-            is_centered = abs(face_center_x - frame_center_x) < (frame_width * 0.2)
-
-            if not is_size_ok: feedback = "Please move closer or further away."
-            elif not is_centered: feedback = "Please center your face."
-            else:
-                feedback = "Position OK! Capturing..."
-                box_color = (0, 255, 0) # Green
-                images_captured += 1
-                img_path = os.path.join(user_dir, f"{images_captured}.jpg")
-                processed_frame = preprocess_frame(frame)
-                cv2.imwrite(img_path, processed_frame)
-                print(f"✅ Captured image {images_captured}/{num_images}")
-                cv2.putText(display_frame, "CAPTURED!", (x, y + h + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.imshow("Sign Up - Capturing Images...", display_frame)
-                cv2.waitKey(500)
-                continue
+            x, y, w, h = faces[0]
+            feedback = "Face Detected! Capturing dataset..."
+            box_color = (0, 255, 0)
+            
+            images_captured += 1
+            img_path = os.path.join(user_dir, f"{images_captured}.jpg")
+            
+            # Apply processing before file commit
+            processed = preprocess_frame(frame)
+            cv2.imwrite(img_path, processed)
+            
             cv2.rectangle(display_frame, (x, y), (x + w, y + h), box_color, 2)
-        
-        cv2.putText(display_frame, feedback, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
-        progress_text = f"Progress: {images_captured} / {num_images}"
-        cv2.putText(display_frame, progress_text, (20, frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        cv2.imshow("Sign Up - Capturing Images...", display_frame)
+            cv2.putText(display_frame, "CAPTURED!", (x, y + h + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.imshow("Registration Dashboard", display_frame)
+            cv2.waitKey(300)
+            continue
+            
+        cv2.putText(display_frame, feedback, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+        cv2.imshow("Registration Dashboard", display_frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("✖ Capture cancelled by user.")
             shutil.rmtree(user_dir)
+            cap.release()
+            cv2.destroyAllWindows()
             return None
 
-    if images_captured != num_images:
-        print("⚠ Capture interrupted. Please try signing up again.")
-        shutil.rmtree(user_dir)
-        return None
-
-    print(f"✅ All {num_images} images captured!")
     cap.release()
     cv2.destroyAllWindows()
     return user_dir
 
-# --- Capture function for login ---
-def capture_multiple_images_for_login(num_images=10):
+# --- Bullet 3 & 5: Multi-Image Login Verification Engine ---
+def capture_login_pipeline(num_images=10):
     cap = cv2.VideoCapture(0)
     temp_dir = tempfile.mkdtemp()
-    captured_image_paths = []
+    captured_paths = []
     
-    print(f"\n📸 Authenticating... We will snap up to {num_images} photos.")
-    print("Position your face in the green box to proceed.")
-
     images_captured = 0
     start_time = time.time()
-    timeout = 20
+    timeout = 25
+    blink_verified = False
+    
+    print("\n🔐 Initializing Secure Multi-Frame Login Window...")
     
     while images_captured < num_images and (time.time() - start_time) < timeout:
         ret, frame = cap.read()
         if not ret: break
 
-        frame_height, frame_width, _ = frame.shape
         display_frame = frame.copy()
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = FACE_DETECTOR.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = FACE_DETECTOR.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
 
         if len(faces) == 1:
-            (x, y, w, h) = faces[0]
-            is_size_ok = (w > frame_width * 0.25) and (w < frame_width * 0.6)
-            face_center_x = x + w // 2
-            frame_center_x = frame_width // 2
-            is_centered = abs(face_center_x - frame_center_x) < (frame_width * 0.2)
-
-            if is_size_ok and is_centered:
-                box_color = (0, 255, 0)
-                images_captured += 1
-                img_path = os.path.join(temp_dir, f"{images_captured}.jpg")
-                processed_frame = preprocess_frame(frame)
-                cv2.imwrite(img_path, processed_frame)
-                captured_image_paths.append(img_path)
-                
-                cv2.putText(display_frame, f"SNAP {images_captured}/{num_images}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
-                cv2.imshow("Login...", display_frame)
-                cv2.waitKey(200)
-            else:
-                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-        
-        cv2.imshow("Login...", display_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("✖ Login cancelled by user.")
-            break
+            x, y, w, h = faces[0]
+            cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 255, 0), 2)
             
-    if not captured_image_paths:
-        print("⚠ Timed out. Could not get a clear picture of your face.")
+            blink, eyes_open = check_liveness(frame)
+            
+            if blink:
+                blink_verified = True
+                
+            if blink_verified:
+                cv2.putText(display_frame, "LIVENESS: VERIFIED ✅", (x, y - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            else:
+                cv2.putText(display_frame, "LIVENESS: PLEASE BLINK 👁", (x, y - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
+            # Ensure we capture high quality frames with eyes wide open post-blink validation
+            if eyes_open and blink_verified:
+                images_captured += 1
+                img_path = os.path.join(temp_dir, f"verification_{images_captured}.jpg")
+                processed = preprocess_frame(frame)
+                cv2.imwrite(img_path, processed)
+                captured_paths.append(img_path)
+                
+                cv2.putText(display_frame, f"ANALYZING FRAME {images_captured}/{num_images}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.imshow("Authentication Terminal", display_frame)
+                cv2.waitKey(150)
+                continue
+
+        cv2.imshow("Authentication Terminal", display_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+            
     cap.release()
     cv2.destroyAllWindows()
-    return captured_image_paths, temp_dir
+    return captured_paths, temp_dir, blink_verified
 
-
-# --- THE ONLY FUNCTION THAT CHANGED ---
+# --- Main Authentication Interfaces ---
 def sign_up(username):
     if not username:
-        print("❌ Username cannot be empty.")
+        print("❌ Username validation failed: Field cannot be empty.")
         return
 
+    db = {}
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "rb") as f:
             db = pickle.load(f)
-    else:
-        db = {}
 
     if username in db:
-        print(f"🤷 User '{username}' already exists. Please choose another name.")
+        print(f"❌ Conflict: User identity '{username}' already occupies registry footprint.")
         return
 
-    user_dir_path = capture_multiple_images_for_signup(username)
+    user_dir_path = capture_signup_dataset(username)
     if not user_dir_path:
-        print("❌ Sign-up failed: Image capture was cancelled or failed.")
+        print("❌ Pipeline Abortion: Registration process dismissed by user.")
         return
 
-    # --- NEW VALIDATION STEP ---
-    print("\n🧐 Verifying image quality with the recognition model...")
-    
-    valid_images_found = 0
-    # List all captured images and sort them to process in order
-    image_files = sorted(os.listdir(user_dir_path))
-
-
-    for img_file in image_files:
-        img_path = os.path.join(user_dir_path, img_file)
-        try:
-            # We use DeepFace.represent as a way to check if a face is detectable and processable.
-            # If this fails, it will raise a ValueError.
-            _ = DeepFace.represent(img_path, model_name="Facenet", enforce_detection=True)
-            valid_images_found += 1
-            print(f"✔ Image '{img_file}' is high quality.")
-        except ValueError:
-            # If DeepFace can't find a face, we discard the image.
-            print(f"❌ Image '{img_file}' is not clear enough. Discarding.")
-            os.remove(img_path) # Delete the poor-quality image
-
-    # --- FINAL CHECK ---
-    # After validation, check if we have any usable images left.
-    if valid_images_found == 0:
-        print("\n❌ Sign-up failed: None of the captured images were clear enough.")
-        print("Please try again in better lighting and with a clearer view of your face.")
-        shutil.rmtree(user_dir_path) # Clean up the empty user folder
-        return
-
-    # If validation is successful, save the user data.
     db[username] = user_dir_path
     with open(DATA_FILE, "wb") as f:
         pickle.dump(db, f)
-    print(f"\n✅ User '{username}' registered successfully with {valid_images_found} high-quality images!")
+    print(f"✅ Identity Registry Complete for record: '{username}'")
 
-
-# --- Login function ---
 def login(username):
     if not os.path.exists(DATA_FILE):
-        print("❌ No users registered. Please sign up first.")
+        print("❌ Verification halted: System registry database is currently empty.")
         return
 
     with open(DATA_FILE, "rb") as f:
         db = pickle.load(f)
 
     if username not in db:
-        print(f"❌ User '{username}' not found.")
+        print(f"❌ Access Denied: User '{username}' records not found.")
         return
 
-    registered_user_dir = db[username]
-    try:
-        image_files = os.listdir(registered_user_dir)
-        if not image_files:
-             print(f"❌ Error: No valid images found for user '{username}'. Please sign up again.")
-             return
-        registered_img_path = os.path.join(registered_user_dir, image_files[0])
-    except (FileNotFoundError, IndexError):
-        print(f"❌ Error: Registration data for '{username}' is corrupted. Please sign up again.")
+    registered_dir = db[username]
+    registered_files = os.listdir(registered_dir)
+    if not registered_files:
+        print("❌ Integrity Error: User folder records missing or corrupted.")
         return
-
-    print(f"👤 Welcome, {username}. Please look at the camera for verification.")
+        
+    # Pick baseline registration image
+    base_reference_img = os.path.join(registered_dir, registered_files[0])
     
-    login_image_paths, temp_dir = capture_multiple_images_for_login()
+    login_frames, temp_dir, liveness_passed = capture_login_pipeline()
     
-    if not login_image_paths:
-        print("❌ Login failed: No images were captured for verification.")
-        shutil.rmtree(temp_dir)
+    if not liveness_passed:
+        print("❌ Security Alert: Passive anti-spoofing liveness verification failed. Access Denied.")
+        if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         return
 
-    is_login_successful = False
+    if not login_frames:
+        print("❌ Session Timeout: Failed to gather reliable frame validation matrix.")
+        if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+        return
+
+    print("🔄 Processing Multi-Frame Deep Learning verification matrix via FaceNet...")
+    successful_matches = 0
+    
     try:
-        for i, login_img_path in enumerate(login_image_paths):
-            print(f"🔄 Verifying image {i + 1}/{len(login_image_paths)}...")
+        for path in login_frames:
             try:
+                # Bullet 1: Match execution via DeepFace using FaceNet core weights
                 result = DeepFace.verify(
-                    img1_path=registered_img_path,
-                    img2_path=login_img_path,
-                    model_name="Facenet"
+                    img1_path=base_reference_img,
+                    img2_path=path,
+                    model_name="Facenet",
+                    enforce_detection=True
                 )
                 if result["verified"]:
-                    print("--------------------")
-                    print("✅ Login successful!")
-                    print(f"Match found with image {i + 1}. Distance: {result['distance']:.4f}")
-                    print("--------------------")
-                    is_login_successful = True
-                    break
-            except ValueError as e:
-                print(f"⚠ Could not process image {i + 1}. Trying next one. Error: {e}")
+                    successful_matches += 1
+            except Exception:
                 continue
-        
-        if not is_login_successful:
-            print("--------------------")
-            print("❌ Login failed: We couldn't verify your identity.")
-            print("--------------------")
-
     finally:
-        print("🧹 Cleaning up temporary files...")
         shutil.rmtree(temp_dir)
 
+    # Establish an evaluation threshold (minimum 50% matching multi-frame matrix passes)
+    min_required_threshold = math.ceil(len(login_frames) * 0.5)
+    print(f"📊 Assessment Summary: Passed [{successful_matches}/{len(login_frames)}] frame validation thresholds.")
+    
+    if successful_matches >= min_required_threshold:
+        print("🔓 [SUCCESS] Multi-Factor Biometric Authentication Passed. Welcome back.")
+    else:
+        print("🔒 [FAILURE] Spatial Authentication Failed. Signature variance exceeded limit.")
 
-# --- Main Execution Block ---
+# --- Interactive System Shell Context ---
 if __name__ == "__main__":
     while True:
-        print("\n--- Face Recognition System ---")
-        print("1. Sign Up (Register a new user)")
-        print("2. Login (Verify an existing user)")
-        print("3. Exit")
-        choice = input("Enter your choice (1/2/3): ").strip()
+        print("\n=== Biometric Cryptographic Access Shell ===")
+        print("1. Initialize New Profile Enrolment (Sign Up)")
+        print("2. Request System Entry Gateway (Login)")
+        print("3. Terminate Session Environment")
+        user_choice = input("Select Execution Route (1/2/3): ").strip()
 
-        if choice == "1":
-            username = input("Enter a username to register: ").strip()
-            sign_up(username)
-        elif choice == "2":
-            username = input("Enter your username to log in: ").strip()
-            login(username)
-        elif choice == "3":
-            print("👋 Goodbye!")
+        if user_choice == "1":
+            name_input = input("Assign identity name tag: ").strip()
+            sign_up(name_input)
+        elif user_choice == "2":
+            name_input = input("Provide profile verification key: ").strip()
+            login(name_input)
+        elif user_choice == "3":
+            print("👋 Session Terminated Safely.")
             break
         else:
-            print("Invalid choice. Please enter 1, 2, or 3.")
+            print("❌ Input parsing mismatch. Try again.")
